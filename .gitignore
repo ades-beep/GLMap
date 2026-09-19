@@ -1,0 +1,26 @@
+# --- Secrets / API keys ---
+.env
+HM3DAPI.txt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Conda: environment + package cache (regenerate from environment.yml) ---
+conda_envs/
+conda_pkgs/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS ---
+.DS_Store
+Thumbs.db
