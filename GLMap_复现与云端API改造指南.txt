@@ -1,0 +1,688 @@
+================================================================================
+GLMap 项目架构梳理 · 复现步骤 · 代理时机 · 云端 API 改造方案
+================================================================================
+生成日期：2026-09-16
+生成方式：基于 README.md 全文 + src/ 源码静态阅读 + 本机环境实测，未对项目做任何修改
+本机环境：Linux 5.15 / RTX 3060 12GB (12288 MiB) / 项目路径 /mnt/diskdata/my_projects/GLMap
+
+【重要前提】本目录不是 git 仓库（没有 .git、也没有 .gitmodules），third_party/ 下 4 个
+子目录全部为空。README 里的 `git submodule update --init --recursive` 在本机必然报
+"fatal: not a git repository"。详见第 2 节步骤 2 与第 5 节。
+
+
+================================================================================
+0. 结论速览（TL;DR）
+================================================================================
+
+【项目是什么】
+CVPR 2026 Highlight 论文《Multi-Scale Gaussian-Language Map for Zero-shot Embodied
+Navigation and Reasoning》的官方核心代码。在 Habitat 仿真环境里，让 agent 边走边把
+RGB-D 观测建成一张"3D 高斯 + 语言"的多尺度语义地图（GLMap），支持零样本具身导航与推理。
+
+【架构一句话】
+Habitat 仿真 → (RGB-D) → MLLM 开放词汇物体/群组提议 → VLM(GroundingDINO/YOLOv7) 检测
+→ MobileSAM 分割 → 深度反投影出彩色点云 → 逐实例高斯参数估计（3DGS）→ 实例/群组管理器
++ 空间索引 → 跨帧融合（几何+文本）→ 序列化(pkl) / PLY 导出 / 渲染。
+
+【复现难度定位】
+- 工程量中等偏大：4 个 GitHub 子模块 + Habitat 全家桶 + 5 个神经网络权重 + HM3D 数据集。
+- 中国大陆有 4 个必须开代理的卡点：4 个子模块 clone、mobile-sam 的 git+https 安装、
+  VLM 权重的 GitHub Releases 下载、BLIP2 的 HuggingFace 权重下载。
+- 数据集 HM3D 需要**申请授权**（学术邮箱 + 数天审批），这是最不可控的一步。
+
+【你的 3060 12GB 能用吗？】
+能用，而且比你预想的乐观。真正跑不动的是 MLLM 里的 gemma3:27b（README 明说需 ≥24GB）。
+但项目里**已经内置了 OpenAI 兼容的云端 MLLM 接口** src/mllm/openai_mllm.py，默认就指向
+阿里云百炼(DashScope)，所以"改成云端 API"几乎只是**接线工作（改 3 个文件、约 10 行）**，
+不需要从零写接口。所有 VLM（GroundingDINO/MobileSAM/YOLOv7）本地显存占用很小，
+完全可以留在 3060 上跑。详见第 4 节。
+
+
+================================================================================
+1. 项目架构
+================================================================================
+
+1.1 论文与定位
+--------------------------------------------------------------------------------
+- 标题：Multi-Scale Gaussian-Language Map for Zero-shot Embodied Navigation and Reasoning
+- 会议：CVPR 2026，Highlight，页码 37086-37097
+- 作者：Sixian Zhang, Yiyao Wang, Xinhang Song, Keming Zhang, Zijian Xu, Shuqiang Jiang
+- 核心思想：把场景表示成"多尺度"结构 —— 底层是**实例(instance)**级 3D 高斯，
+  上层是**群组(group)**级（功能上协同/交互的物体集合，如"桌子+椅子=休息娱乐区"），
+  两层都挂语言描述，从而实现零样本的开放词汇导航与推理。
+
+1.2 目录与模块职责
+--------------------------------------------------------------------------------
+GLMap/
+├── demo.py                  # 手动控制 Demo（Habitat 中增量建图，出口持久化 GLMap）
+├── environment.yml          # conda 环境定义（conda 部分 + pip 部分）
+├── config/                  # Hydra 配置：habitat_eval_hm3dv1 / hm3dv2 / mp3d
+├── src/
+│   ├── mllm/                # ★ 大模型接口层（云端 API 改造的核心）
+│   │   ├── mllm_base.py        # 抽象基类 MLLM_Protocol + 通用方法 MLLM_Mixin
+│   │   ├── ollama_mllm.py      # 本地 Ollama 实现（默认，当前被调用的是这个）
+│   │   ├── openai_mllm.py      # ★ 已存在的 OpenAI 兼容云端实现（DashScope 默认）
+│   │   ├── prompts.py          # 全部提示词（grounding / 合并 / 描述 / 打分）
+│   │   ├── parsers/            # 输出解析与校验（ast.literal_eval + 类别过滤）
+│   │   └── utils.py            # PIL 图 → base64 / data-uri
+│   ├── vlm/                 # 视觉模型层（全程可本地跑）
+│   │   ├── config.py           # 端口与 HTTP/本地模式开关（环境变量驱动）
+│   │   ├── server_wrapper.py   # Flask 把模型包成 REST 服务（localhost）
+│   │   ├── detector/grounding_dino.py   # 开放词汇检测（端口 12181）
+│   │   ├── detector/yolov7.py           # COCO 类别检测（端口 12184）
+│   │   ├── itm/blip2itm.py              # BLIP2 图文匹配（端口 12182）
+│   │   ├── segmentor/sam.py             # MobileSAM 分割（端口 12183）
+│   │   └── api/get_object_utils.py      # detect_objects()：检测+分割编排入口
+│   ├── glmap/               # ★ 地图核心
+│   │   ├── api.py              # update_gl_map()：单步增量建图主流程（最该先读的文件）
+│   │   ├── glmap.py            # GLMap 主类（持有 managers / estimator / mllm）
+│   │   ├── config.py           # 全部超参与模型 ID 集中在此（改造要动这里）
+│   │   ├── core/               # instance_manager / group_manager / spatial_index / mapping_utils
+│   │   ├── fusion/             # merge_instance.py / merge_group.py（跨帧融合，会再调 MLLM）
+│   │   └── io/                 # serialization(pkl) / visualization_3d(PLY) / visualization
+│   ├── gaussian/            # 3D 高斯：data / estimator / io(PLY) / rendering(光栅化)
+│   └── utils/               # 坐标变换、几何、Habitat 适配、点云工具
+├── third_party/             # 4 个子模块【当前全为空】
+│   ├── diff-gaussian-rasterization/  # 高斯光栅化
+│   ├── GroundingDINO/                # 开放词汇检测
+│   ├── habitat-lab/                  # Habitat（需 v0.3.1 tag）
+│   └── yolov7/                       # YOLOv7 检测
+├── conda_envs/glmap/        # 【已存在但残缺】本机现存的 conda 前缀环境，见第 5 节
+└── conda_pkgs/              # 【已存在】conda 包缓存 383 个（此配置的 pkgs_dirs）
+
+1.3 数据流：一次 update_gl_map() 的完整链路
+--------------------------------------------------------------------------------
+对应 src/glmap/api.py，这是理解全项目的关键函数，按顺序做 9 件事：
+
+  (1) 读观测：rgb / depth / gps / compass
+  (2) 坐标变换：Habitat 的 xRyUzB → 项目内部的 xFyLzU，相机高度固定 +0.88m
+  (3) 【调 MLLM】mllm.grounding(image) —— 抽帧下采样 2 倍后送多模态大模型，
+      要求返回 {scene_summary, objects[{instance_id, category, description}],
+      groups[{instances[], description}]}。即"开放词汇的物体与群组提议"。
+      结果落盘 outputs/{scene}_{ep}/ {step}/mllm_result.json
+  (4) 类别去重（每类只保留一个），得到 categories 列表
+  (5) 【调 VLM】detect_objects()：类别分流 —— COCO 类走 YOLOv7，自定义类走
+      GroundingDINO；再用 MobileSAM 按 bbox 分割出 mask。可视化落盘 segmented_img.png
+  (6) 掩码过滤：去空 mask、同类别只保留分数最高的、再按点云非空过滤
+  (7) 【调 3DGS 估计器】get_habitat_object_point_clouds() 深度反投影出带色点云，
+      GaussianEstimator.estimate() 逐实例估出高斯参数(means/scale/rot/opacity/SH)
+  (8) 【写地图】add_instance_from_property() 建实例；mllm_result.groups 经 local_id
+      → global_id 映射后 add_group_from_property() 建群组
+  (9) 释放显存 torch.cuda.empty_cache()
+
+另外两条"隐式"的 MLLM 调用路径（容易漏看，改造时必须一起改）：
+  - src/glmap/core/instance_manager.py:84 → fusion/merge_instance.py:renew_instance_description()
+    实例描述历史不一致时，调 MLLM 重新归纳 category/description
+  - src/glmap/core/group_manager.py:123 → fusion/merge_group.py:generate_group_description()
+    每 GROUP_MERGE_INTERVAL(=3) 步，调 MLLM 生成群组描述
+  - fusion 里还用 embed_text 做文本相似度（nomic-embed-text），阈值 0.7
+
+1.4 依赖的三类外部模型（决定改造边界）
+--------------------------------------------------------------------------------
+  A. MLLM（多模态大模型）——"大脑"，做开放词汇提议与语义归纳
+     默认 Ollama 本地：gemma3:27b（grounding，需 ≥24GB 显存）
+                       qwen3:8b（合并/描述，注意是**纯文本**任务）
+                       nomic-embed-text（文本嵌入）
+     ★ 这是 3060 12GB 唯一跑不动、也是唯一需要换成云端 API 的部分。
+
+  B. VLM（视觉模型）——"眼睛"，检测与分割，全部本地、显存友好
+     GroundingDINO(SwinT, ~700MB) / MobileSAM(~40MB) / YOLOv7-e6e(~290MB)
+     / BLIP2-ITM（默认路径未被 get_object_utils 直接调用，属可选）
+     ★ 建议保留本地，无需改造。
+
+  C. 3D 高斯光栅化 —— diff_gaussian_rasterization 的 CUDA 扩展（需编译，依赖 nvcc）
+
+
+================================================================================
+2. 复现步骤（含本机实测状态标注）
+================================================================================
+
+步骤 0：前置检查（本机实测结论）
+--------------------------------------------------------------------------------
+[!] 本机 **没有安装 conda**：`which conda` 为空；/home/work/anaconda3/ 下只剩一个
+    pkgs/ 目录，没有 bin/python。[必须] 先装 Miniconda 或 Anaconda。
+[!] 本机 **没有 nvcc** 的话，diff-gaussian-rasterization 无法编译。需要装与
+    torch cu124 匹配的 CUDA Toolkit（11.8/12.4 均可，建议 12.4）。
+[!] 目录不是 git 仓库（无 .git / .gitmodules）。见步骤 2。
+[!] data/ 目录不存在（需要自建放权重）；outputs/ 不存在（运行后自动创建）。
+[OK] GPU 确认：RTX 3060，12288 MiB。磁盘 /mnt/diskdata 剩余 383G（HM3D 建议预留
+     150G+）。
+
+步骤 1：conda 环境
+--------------------------------------------------------------------------------
+安装 conda 后：
+
+    cd /mnt/diskdata/my_projects/GLMap
+    conda env create -f environment.yml
+    conda activate glmap
+
+【本机现状提醒】conda_envs/glmap 已存在，但**是残缺的**：conda 部分装好了
+（约 190 个包 / 2.1G，主要是 Qt6 全家桶、numpy 1.26.4、matplotlib 等），
+但 **pip 部分一条都没装** —— site-packages 里没有 torch、没有 habitat、
+没有 openai/ollama、没有 lavis、没有 open3d、没有 ultralytics。
+而且它的创建记录显示是用 `/home/laotou/miniconda3/bin/conda`（**另一个用户、
+另一台机器**）在 2026-09-15 创建的，路径前缀已失效。
+
+建议做法：**不要复用这个环境**，装好本机 conda 后重新 `conda env create`，
+或者至少用 `conda env update -p ./conda_envs/glmap -f environment.yml` 补齐。
+另外注意 environment.yml 的 pip 段里：
+  - `--extra-index-url https://download.pytorch.org/whl/cu124`（官方源，国内慢/需代理）
+  - `numpy==1.23.5`（pip 段）与本机 conda 已装的 1.26.4 冲突，可能引发 numba/llvmlite
+    的不兼容，重装环境可避免。
+
+步骤 2：四个子模块（★ 最大的坑）
+--------------------------------------------------------------------------------
+README 写的是：
+    git submodule update --init --recursive
+    pip install third_party/diff-gaussian-rasterization
+
+【本机必然失败】因为本目录没有 .git 和 .gitmodules（你拿到的是源码快照，
+不是 clone 下来的仓库）。所以这一步必须**手工 clone 四个仓库**：
+
+    cd third_party
+    git clone https://github.com/graphdeco-inria/diff-gaussian-rasterization.git
+    git clone https://github.com/IDEA-Research/GroundingDINO.git
+    git clone https://github.com/WongKinYiu/yolov7.git
+    git clone https://github.com/facebookresearch/habitat-lab.git
+    cd habitat-lab && git checkout tags/v0.3.1 && cd ..   # README 要求 v0.3.1
+
+    cd ..   # 回到项目根
+    pip install third_party/diff-gaussian-rasterization
+
+[注意1] README 没给出这四个仓库的具体 URL（因为 .gitmodules 丢了）。
+        diff-gaussian-rasterization 的**具体 fork 无法从快照确定** —— 源码里只
+        `from diff_gaussian_rasterization import GaussianRasterizer`，这是原始
+        graphdeco-inria 版本的模块名与类名，所以先用官方仓库试；
+        若源码用到官方版没有的参数（如 scale_modifier 之外的自定义项）导致
+        import 或调用报错，再去作者主页找 CVPR 2026 配套的 fork。
+[注意2] diff-gaussian-rasterization 需要能编译 CUDA 扩展（nvcc + torch 版本匹配）。
+        编译失败时：demo 默认会落 PLY 文件，可以丢到
+        <https://superspl.at/editor> 在线查看高斯结果（README 明确给了这个兜底方案）。
+[注意3] YOLOv7 在本项目里同时被两处用到：third_party/yolov7（权重/结构）和
+        src/vlm/detector/yolov7.py（服务封装）。检测权重由步骤 6 的 wget 提供。
+
+步骤 3：Habitat（仿真环境）
+--------------------------------------------------------------------------------
+README 给的装法（在 third_party/habitat-lab 内）：
+
+    cd third_party/habitat-lab
+    git checkout tags/v0.3.1
+    pip install -e habitat-lab
+    pip install -e habitat-baselines
+
+【需要补充】README 没写 habitat-sim 本体怎么装，但装了 habitat-lab 后必须有
+`habitat_sim` 才能 import（README 也说"装完 pip list 里应能看到 habitat_sim"）。
+habitat-sim 0.3.1 与 python 3.9 匹配，建议：
+
+    pip install habitat-sim==0.3.1          # 带显示，demo 需要 GUI
+    # 若只想无头跑：pip install habitat-sim-headless==0.3.1（但 demo.py 的 OpenCV
+    #   窗口和 Qt 会缺失，README 明确说了需要显示器或 X11 转发）
+
+【本机注意】没有显示器时会报：
+    "This application failed to start because no Qt platform plugin could be initialized"
+解决方案二选一：
+  (a) 本地有图形界面 / VSCode 远程 X11 转发（README 要求的方式）
+  (b) 用虚拟显示兜底：`xvfb-run -a python demo.py --preset`
+      —— 但 --preset 模式下代码会跳过 cv2.namedWindow/imshow，所以纯脚本跑不需要
+      显示器；只有手动键盘模式才必须 X11。
+
+步骤 4：数据集（★ 最耗时、最不可控）
+--------------------------------------------------------------------------------
+4.1 HM3D（Habitat-Matterport 3D）—— **需要申请授权**
+    - 申请入口：https://aihabitat.org/datasets/hm3d/  （填表申请，通常要求
+      学术/机构邮箱，写明用途，审批一般几个工作日）
+    - 审批通过后拿到下载链接，再按 habitat-sim 的 DATASETS.md 下载：
+      https://github.com/facebookresearch/habitat-sim/blob/main/DATASETS.md
+      #habitat-matterport-3d-research-dataset-hm3d
+    - 体量：完整数据集非常大（数十~上百 GB 量级，HM3D 全量 >100GB）。
+      跑 demo 只需要 val split（scene "Dd4bFSTQ8gi" 属于 HM3D val），
+      但官方是按 split 打包的，实际还是要下 val 那几十 GB。
+    - 下载源是 AWS S3，国内一般可直连但速度慢，开代理会明显加速。
+
+4.2 MP3D（Matterport3D）—— 同样需要申请/签署使用条款
+    https://github.com/facebookresearch/habitat-sim/blob/main/DATASETS.md
+    #matterport3d-mp3d-dataset
+    （只跑 HM3D demo 的话可以跳过 MP3D）
+
+4.3 ObjectNav 情节数据（episode）
+    三个 config 引用的是：
+      data/datasets/objectnav/hm3d/v1/{split}/{split}.json.gz   （hm3dv1）
+      data/datasets/objectnav/hm3d/v2/{split}/{split}.json.gz   （hm3dv2）
+      （mp3d 同理）
+    从 habitat-lab 的 DATASETS.md 获取（官方托管在 dl.fbaipublicfiles.com）。
+    国内一般可直连。
+
+4.4 目录结构（README 要求，软链接非必须）
+    data/
+    ├── datasets/objectnav/            # 情节 json.gz
+    ├── scene_datasets/
+    │   ├── hm3d     -> ../versioned_data/hm3d-0.2/hm3d
+    │   ├── hm3d_v0.2 -> ./hm3d
+    │   └── mp3d
+    └── versioned_data/hm3d-0.2/       # 场景 .glb
+
+步骤 5：MLLM（当前默认走本地 Ollama，你大概率要换成云端，见第 4 节）
+--------------------------------------------------------------------------------
+默认方案（README 原版）：
+    # 安装 Ollama（https://ollama.com）
+    ollama pull gemma3:27b        # ★ 需 ≥24GB 显存，3060 12G 跑不了
+    ollama pull qwen3:8b          # 8B，3060 12G 可跑
+    ollama pull nomic-embed-text  # 嵌入模型，很小
+
+若你要先在**不改代码**的前提下尽力跑通，只把 grounding 的模型降级：
+    ollama pull gemma3:12b   # 然后改 src/glmap/config.py 的 MLLMConfig.MODEL_ID
+但这只是"能用"，效果会比论文差，且 12B 在 12GB 上还要靠量化/offload。
+所以更推荐直接上第 4 节的云端 API 方案。
+
+步骤 6：VLM（权重下载 + 起服务）
+--------------------------------------------------------------------------------
+6.1 下载权重（README 原文，注意需要先建 data/ 目录）
+
+    mkdir -p data
+    # mobile sam
+    wget -O data/mobile_sam.pt \
+      https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt
+    # groundingdino
+    wget -O data/groundingdino_swint_ogc.pth \
+      https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
+    # yolov7
+    wget -O data/yolov7-e6e.pt \
+      https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-e6e.pt
+
+    【★ 全部是 github.com / GitHub Releases，中国大陆必须开代理】
+
+    另外 GroundingDINO 的 pip 安装（README 指向其 Install Guide）：
+        pip install -e third_party/GroundingDINO
+
+6.2 启动 VLM 服务（README 推荐以 HTTP 服务方式常驻，避免每次启动重载模型）
+
+    # 在项目根目录执行；如果报 ModuleNotFoundError: vlm，先：
+    export PYTHONPATH=$PWD/src
+
+    python -m src.vlm.detector.grounding_dino --port 12181
+    python -m src.vlm.itm.blip2itm          --port 12182
+    python -m src.vlm.segmentor.sam         --port 12183
+    python -m src.vlm.detector.yolov7       --port 12184
+
+    默认就是 HTTP 模式（src/vlm/config.py 里 DEFAULT_HTTP_MODE="true"）。
+    改成进程内本地模式（省去起服务，但每次启动都要重载模型）：
+        export VLM_GROUNDING_DINO_HTTP_MODE=false
+        export VLM_MOBILE_SAM_HTTP_MODE=false
+        export VLM_BLIP2ITM_HTTP_MODE=false
+        export VLM_YOLOV7_HTTP_MODE=false
+
+    【BLIP2 特别注意】blip2itm.py 会 `from lavis.models import
+    load_model_and_preprocess` 并在首次加载时**从 HuggingFace 拉权重**。
+    HuggingFace 在中国大陆被墙 —— 这一步必须开代理，或设镜像：
+        export HF_ENDPOINT=https://hf-mirror.com
+    （demo 主链路其实不直接调 BLIP2，但你把 12182 服务起起来就会触发下载）
+
+6.3 端口与显存
+    12181 GroundingDINO / 12182 BLIP2-ITM / 12183 MobileSAM / 12184 YOLOv7
+    端口可用环境变量覆盖：VLM_GROUNDING_DINO_PORT 等（见 src/vlm/config.py）
+    显存合计约 1~1.5GB，3060 12GB 毫无压力。
+
+步骤 7：运行 Demo
+--------------------------------------------------------------------------------
+前置：Ollama、4 个 VLM 服务都已在跑。
+
+    # 手动键盘控制（需要显示器/X11）
+    python demo.py
+
+    # 预设动作序列（原地转 12 次 + 停止），适合无头调试
+    python demo.py --preset
+
+    按键：w 前进 / a 左转 / d 右转 / f 停止结束
+
+    切换数据集：改 demo.py 里 @hydra_main 的 config_name
+        （habitat_eval_hm3dv1 / hm3dv2 / mp3d）
+    切换场景与情节：改 demo.py 第 ~154 行
+        target_scene, target_episode = "Dd4bFSTQ8gi", "0"
+
+    输出（README 已说明）：
+        outputs/{scene}_{episode}/
+        ├── glmap.pkl                                  # 序列化的 GLMap
+        ├── gaussians/instance_{id}_{category}.ply     # 逐实例高斯
+        ├── rendered/instance_{id}_{category}.png      # 渲染图
+        │              group_all.png
+        └── {step}/
+            ├── mllm_result.json   # MLLM 原始接地输出（调试 MLLM 效果就看它）
+            └── segmented_img.png  # 检测分割可视化
+
+    【性能预期】README 明说建图会因 MLLM 推理而变慢。用云端 API 后每步一次网络
+    往返，延迟主要取决于 API，建议先用 --preset 跑通再手动控。
+
+复现 Checklist（可打勾）
+--------------------------------------------------------------------------------
+[ ] 步骤0 装 conda + 与本机 torch 匹配的 CUDA Toolkit(nvcc)
+[ ] 步骤1 重建 glmap 环境（不要复用残缺的 conda_envs/glmap）
+[ ] 步骤2 手工 clone 4 个子模块（v0.3.1）并编译 diff-gaussian-rasterization
+[ ] 步骤3 装 habitat-sim 0.3.1 + habitat-lab/baselines
+[ ] 步骤4 申请并下载 HM3D（授权！）+ ObjectNav 情节数据
+[ ] 步骤5 决定 MLLM 走本地还是云端（见第 4 节）
+[ ] 步骤6 下 3 个权重到 data/ + 起 4 个 VLM 服务（PYTHONPATH=$PWD/src）
+[ ] 步骤7 python demo.py --preset 跑通，检查 outputs/ 下产物
+[ ] 步骤8 开 PLY 看高斯效果（或丢到 https://superspl.at/editor）
+
+
+================================================================================
+3. 中国大陆网络：什么时候需要开代理
+================================================================================
+
+【总体规律】
+  · 需要代理的 = GitHub(含 Releases / raw) 和 HuggingFace。
+  · 不需要代理、换国内镜像即可 = PyPI、conda-forge/defaults。
+  · 数据集下载源(AWS S3 / dl.fbaipublicfiles.com / aihabitat.org) 国内一般可直连，
+    只是慢；开代理可显著加速。
+  · **运行时(demo)全程走 localhost**，不需要代理 —— 但反过来，如果你开着全局代理，
+    要确保 localhost 不走代理，否则请求 12181~12184 和 ollama 会失败。
+
+建议的两个环境变量（Clash 常用端口 7890，按你实际改）：
+    export http_proxy=http://127.0.0.1:7890
+    export https_proxy=http://127.0.0.1:7890
+    export no_proxy=localhost,127.0.0.1,0.0.0.0        # ★ 运行时必须有
+
+───────────────────────────────────────────────────────────────────────────────
+ 阶段/命令                                    域名                     是否必须代理
+───────────────────────────────────────────────────────────────────────────────
+ 1) conda env create -f environment.yml
+    - conda 部分                               conda.anaconda.org        否*（换镜像）
+                                               repo.anaconda.com
+    - pip torch （--extra-index-url）           download.pytorch.org      建议开
+                                                                        （或换镜像）
+    - pip 其他第三方库                          pypi.org                  否（换镜像）
+    - pip mobile-sam
+      git+https://github.com/...MobileSAM.git  github.com                ★★ 必须
+───────────────────────────────────────────────────────────────────────────────
+ 2) clone 4 个子模块
+    diff-gaussian-rasterization                github.com                ★★ 必须
+    GroundingDINO                              github.com                ★★ 必须
+    yolov7                                     github.com                ★★ 必须
+    habitat-lab                                github.com                ★★ 必须
+───────────────────────────────────────────────────────────────────────────────
+ 3) habitat-sim / habitat-lab 安装              pypi.org                 否（换镜像）
+    （从源码编译 habitat-sim 时会拉        github.com / 各类 CDN      ★ 建议开
+      多个第三方（magnum/corrade 等））
+───────────────────────────────────────────────────────────────────────────────
+ 4) 下载 VLM 权重（3 个 wget）
+    mobile_sam.pt                              github.com (raw)          ★★ 必须
+    groundingdino_swint_ogc.pth                github.com (Releases)     ★★ 必须
+    yolov7-e6e.pt                              github.com (Releases)     ★★ 必须
+───────────────────────────────────────────────────────────────────────────────
+ 5) BLIP2 首次加载权重（起 12182 服务时）        huggingface.co            ★★ 必须
+    （或 export HF_ENDPOINT=https://hf-mirror.com 免代理）
+───────────────────────────────────────────────────────────────────────────────
+ 6) 数据集下载
+    HM3D 申请                                aihabitat.org             否（表单页）
+    HM3D/MP3D 实际下载                        AWS S3                    否，但很慢，
+                                                                        建议开代理
+    ObjectNav 情节数据                        dl.fbaipublicfiles.com    否，但慢
+───────────────────────────────────────────────────────────────────────────────
+ 7) ollama pull gemma3:27b / qwen3:8b
+    / nomic-embed-text                        registry.ollama.ai        通常可直连，
+                                                                        慢，建议开
+───────────────────────────────────────────────────────────────────────────────
+ 8) 运行 demo.py（含 4 个 VLM 服务、
+    Ollama）                                  全部 localhost            ★ 不需要
+                                                                        （务必设 no_proxy）
+───────────────────────────────────────────────────────────────────────────────
+ 9) 走第 4 节云端 API 方案
+    - 阿里云百炼 DashScope                     dashscope.aliyuncs.com    ★ 不需要
+    - OpenAI / Anthropic                      境外域名                  ★ 需要
+───────────────────────────────────────────────────────────────────────────────
+
+【免代理的镜像配置（推荐先配好，能省掉大量等待）】
+  conda（~/.condarc）：
+      channels:
+        - defaults
+      default_channels:
+        - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+        - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+      custom_channels:
+        conda-forge: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+        pytorch:     https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  pip：
+      pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+      # torch 若不想走 download.pytorch.org，直接用上面的源装 torch==2.5.0 即可
+      # （PyPI 的 linux torch 默认就是 CUDA 版）
+  HuggingFace（可免代理）：
+      export HF_ENDPOINT=https://hf-mirror.com
+  GitHub 免代理兜底（不稳定，仅应急）：把 https://github.com/ 替换为
+      https://ghproxy.net/https://github.com/  或 https://gitclone.com/github.com/
+
+【本机现状提醒】~/.config/pip/pip.conf 里只有 `no-cache-dir = true`
+（NVIDIA PyIndex 自动生成的），**没有配置国内镜像**，建议补上 index-url。
+
+
+================================================================================
+4. 云端 API 改造方案（面向 RTX 3060 12GB）
+================================================================================
+
+4.1 先明确边界：什么该上云，什么该留本地
+--------------------------------------------------------------------------------
+  上云：只有 MLLM。理由——gemma3:27b 需要 24GB 显存（README 原文），3060 只有 12GB；
+        而 MLLM 是纯 API 调用式的"大脑"，改成 HTTP 调用不影响任何 3D 逻辑。
+  留本地：全部 VLM（GroundingDINO ~700MB + MobileSAM ~40MB + YOLOv7-e6e ~290MB
+        + BLIP2 可选 ≈ 1~1.5GB 显存）和 3DGS 估计/光栅化（点云规模小，3060 够用）。
+        这些换成 API 反而要传图/传点云，得不偿失，且没有现成接口。
+
+4.2 好消息：云端接口已经写好了，不用从零开发
+--------------------------------------------------------------------------------
+项目里已经存在 src/mllm/openai_mllm.py，而且是**正规实现**：
+
+  class OpenAIMLLM(MLLM_Mixin):
+      def __init__(self, model_id="qwen3-vl-plus",
+                   api_key=None,
+                   base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+
+  · 继承 MLLM_Mixin → 直接拥有 grounding() / compare_instance_similarity() /
+    merge_instance_descriptions() / renew_instance_description() /
+    generate_group_description() / instance_target_value() / group_target_value()
+    这些高层方法，即**接口完全兼容**，可直接替换 OllamaMLLM。
+  · 已实现 chat()（单图）与 chat_images()（文图交替多图），图片用
+    image_to_base64_data_uri() 转 data-uri，符合 OpenAI/GPT-4V 与 DashScope 规范。
+  · 已实现 embed_text()，默认 model_id="text-embedding-v3"（DashScope）。
+  · API key 读取顺序：构造参数 → 环境变量 OPENAI_API_KEY → DASHSCOPE_API_KEY。
+  · 缺 key 时不抛异常，而是 client=None 进入 mock 模式（chat 返回空串），
+    表现为"地图建不出来"而不报错 —— 调试时注意从日志里认这个警告。
+  · openai 包**已经在 environment.yml 里**（第 52 行），无需新增依赖。
+
+4.3 需要动手的地方：3 个文件（约 10 行）
+--------------------------------------------------------------------------------
+当前代码里 OllamaMLLM 被**硬编码**在 3 处，这就是全部改造点：
+
+  (A) src/glmap/glmap.py
+      第 17 行：from mllm.ollama_mllm import OllamaMLLM
+      第 60 行：self.mllm = OllamaMLLM(model_id=MLLMConfig.MODEL_ID)
+                ↑ 这是 grounding 用的多模态模型，即 gemma3:27b 那一处
+
+  (B) src/glmap/fusion/merge_instance.py
+      第 7 行：from mllm.ollama_mllm import OllamaMLLM
+      第 17-22 行：_get_mllm() 里 OllamaMLLM(model_id=InstanceFusionConfig.MERGE_RESULT_LLM_MODEL_ID)
+                  ↑ 模块级单例，用于实例描述归纳 + embed_text 算相似度
+
+  (C) src/glmap/fusion/merge_group.py
+      第 7 行：from mllm.ollama_mllm import OllamaMLLM
+      第 17-22 行：_get_mllm() 里 OllamaMLLM(model_id=GroupFusionConfig.MERGE_DESCRIPTION_MODEL_ID)
+                  ↑ 模块级单例，用于群组描述生成 + embed_text
+
+【推荐改法：加一个统一工厂，三处都调它（避免重复判断逻辑）】
+  新建 src/mllm/factory.py（约 15 行）：
+
+      import os
+      from .ollama_mllm import OllamaMLLM
+      from .openai_mllm import OpenAIMLLM
+
+      def build_mllm(model_id: str):
+          backend = os.getenv("GLMAP_MLLM_BACKEND", "openai").lower()
+          if backend == "openai":
+              return OpenAIMLLM(
+                  model_id=model_id,
+                  api_key=os.getenv("DASHSCOPE_API_KEY"),
+                  base_url=os.getenv(
+                      "GLMAP_MLLM_BASE_URL",
+                      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                  ),
+              )
+          return OllamaMLLM(model_id=model_id)
+
+      # 在 src/mllm/__init__.py 里一并导出
+
+  然后三处改为：
+      from mllm.factory import build_mllm          # 替换原来的 ollama_mllm import
+      self.mllm = build_mllm(MLLMConfig.MODEL_ID)  # 替换原来的 OllamaMLLM(...)
+
+  【为什么不用环境变量直接改 OllamaMLLM】Ollama 官方 python 客户端只能连
+  OLLAMA_HOST（本地/自建 ollama 服务），**不是 OpenAI 兼容协议**，无法直接指向
+  百炼/OpenAI，所以必须换成 OpenAIMLLM 这条路。
+
+4.4 配置项改动（src/glmap/config.py）
+--------------------------------------------------------------------------------
+该文件里的模型 ID 全是 Ollama 的模型名，换成云端后必须全部改掉，否则调用会失败：
+
+  原值（Ollama 模型名）                    云端应改为（示例）
+  ─────────────────────────────────────── ─────────────────────────────────────
+  MLLMConfig.MODEL_ID = "gemma3:27b"      → "qwen3-vl-plus"（★ 必须是**视觉**模型！）
+  InstanceFusionConfig.MERGE_RESULT_LLM_MODEL_ID = "qwen3:8b"   → "qwen-plus"
+  GroupFusionConfig.MERGE_DESCRIPTION_MODEL_ID  = "qwen3:8b"   → "qwen-plus"
+  InstanceFusionConfig.TEXT_EMBEDDING_MODEL_ID  = "nomic-embed-text"
+                                          → "text-embedding-v3"
+  GroupFusionConfig.TEXT_EMBEDDING_MODEL_ID     = "nomic-embed-text"
+                                          → "text-embedding-v3"
+
+【★ 最容易踩的坑】嵌入模型必须改。原因：merge_instance.py:34-35 与
+merge_group.py:28 是这样调的——
+      emb = _get_mllm().embed_text(text, model)     # model 来自上面那两个配置
+而 OpenAIMLLM.embed_text 的签名是 embed_text(self, text, model_id="text-embedding-v3")，
+第二个位置参数就是 model_id。若仍传 "nomic-embed-text"，DashScope 会报模型不存在，
+函数内部 catch 后**返回空 list**，上层 get_text_embedding_similarity 直接
+raise ValueError("Embedding failed...")，表现为建图过程中途崩溃。
+
+4.5 密钥与 .env
+--------------------------------------------------------------------------------
+demo.py 第一行就 `import dotenv; dotenv.load_dotenv()`，所以最省事的方式是在
+**项目根目录**（与 demo.py 同级）新建 .env：
+
+    DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
+    # 可选：切到别的 OpenAI 兼容服务商
+    # OPENAI_API_KEY=sk-...
+    # GLMAP_MLLM_BASE_URL=https://api.openai.com/v1         # 或 https://api.deepseek.com/v1
+    # GLMAP_MLLM_BACKEND=openai
+
+注意：
+  · .env 不要提交到版本库（当前目录还不是 git 仓库，但以后 clone 成仓库要注意）。
+  · 但 **VLM 的 4 个服务进程不会自动加载 .env**（它们不 import dotenv），
+    而它们也不需要 API key，所以无影响；只有 demo.py 需要。
+
+4.6 模型选型建议（2026-09，按"中国大陆 + 无大显存"筛选）
+--------------------------------------------------------------------------------
+  用途                      推荐                        备注
+  ───────────────────────── ─────────────────────────── ───────────────────────────
+  MLLM grounding（需视觉）    qwen3-vl-plus (DashScope)   国内直连免代理，OpenAI 兼容，
+                            或 qwen-vl-max               与 openai_mllm.py 默认值一致
+                            或 glm-4v (智谱)             国内直连
+  MLLM 合并/描述（纯文本）    qwen-plus / deepseek-chat    便宜，任务简单，用文本模型足够
+  文本嵌入                    text-embedding-v3            与embed_text默认值一致
+  ───────────────────────── ─────────────────────────── ───────────────────────────
+  【强烈不建议】用 DeepSeek 做 grounding。config/*.yaml 里那句
+  `llm_client: ollama # deepseek, ollama or none` 是从 VLFM 继承来的遗留配置，
+  而且**这份 yaml 的 llm 配置段在当前代码里根本没被读取**（源码只从
+  src/glmap/config.py 的 dataclass 取模型 ID）。
+  另外 DeepSeek 的 API 是**纯文本**的，没有视觉能力，无法完成 grounding 任务。
+
+4.7 两条落地路线（按你的偏好选一条）
+--------------------------------------------------------------------------------
+【路线 A：全云（最简单，改动最少，强烈推荐先做这个）】
+  · MLLM grounding + 文本 LLM + 嵌入 全部走 DashScope。
+  · 改动 = 4.3 的 3 个文件 + 4.4 的 5 个配置值 + 一个 .env。
+  · 3060 只需承担 VLM(1~1.5G) + 3DGS，显存非常宽裕。
+  · 优点：不用装 Ollama、不用管本地模型显存、省心。
+  · 代价：每步建图一次网络往返，有 API 费用（grounding 是每步一次，最多 500 步；
+          建议先用 --preset 的 ~12 步调试，别一上来就手动走 500 步）。
+
+【路线 B：混合（省 API 费，稍微麻烦）】
+  · grounding（gemma3:27b，跑不动）→ 云端 qwen3-vl-plus。
+  · 文本 LLM（qwen3:8b）+ 嵌入（nomic-embed-text）→ **留在本地 Ollama**，
+    3060 12GB 跑这两个绰绰有余（8B 量化后约 5~6GB）。
+  · 做法：build_mllm() 只替换 glmap.py:60 那一处（grounding），
+          merge_instance.py / merge_group.py 继续用 OllamaMLLM 且保持原配置不动。
+  · 优点：占大头的频繁文本调用不花钱；缺点：要同时维护 Ollama 和云端两套。
+
+  【建议】先用路线 A 打通全流程（排错面小），确认效果后再按需切路线 B。
+
+4.8 其他注意事项
+--------------------------------------------------------------------------------
+  (1) 输出解析对格式敏感：src/mllm/parsers/parser.py 用
+      `ast.literal_eval` 解析模型返回的 dict，**要求是 Python 字面量语法**
+      （True/False/None），如果云端模型返回 JSON 风格的 true/false 会解析失败。
+      prompts.py 里给的示例已经是 True/False（Python 风格），一般没问题；
+      但换模型后如果发现大量 "Postprocessing failed" 日志（MLLM_Mixin
+      有 3 次重试，失败最终返回 {}），第一件事就是去 outputs/{scene}_{ep}/
+      {step}/mllm_result.json 看原文。必要时在提示词里补一句
+      "Output must use Python literals True/False, not JSON true/false"。
+  (2) grounding 会先把图**下采样 2 倍**（MLLM_Mixin.grounding 的
+      downsample_step=2，640x480 → 320x240），这对云端 API 是好事，能省 token。
+  (3) 费用与限流：chat_with_postprocessing 自带 3 次重试；如果遇到限流
+      (429)，可以适当加 sleep 或换更高配额的模型。
+  (4) 无 API key 时不会报错，只会静默走 mock（chat 返回 ""），
+      表现为日志刷 "MLLM returned empty result." → 遇到这个先查 .env。
+  (5) 切云端后**不再需要** 步骤 5 的 ollama pull gemma3:27b（路线 A 下连 Ollama
+      整个都可以不装）。
+  (6) config/ 下那三个 yaml 里的 `llm:` 段（llm_client: ollama / deepseek）
+      是遗留字段，当前代码不读它，**不要被它误导**去改 yaml，模型 ID 请改
+      src/glmap/config.py 的 dataclass。
+
+
+================================================================================
+5. 本机实测状态盘点（我实际检查到的，不是推测）
+================================================================================
+
+ 项目文件
+   [OK]  README.md / demo.py / environment.yml / src/ 完整
+   [OK]  config/ 三个 yaml 齐全（habitat_eval_hm3dv1 / hm3dv2 / mp3d）
+   [空]  third_party/ 下 4 个子目录**均为 0 个文件** —— 未 clone
+   [无]  .git / .gitmodules 不存在 → 不是 git 仓库，README 的 submodule 命令会失败
+   [无]  data/ 目录不存在（VLM 权重无处安放，需先 mkdir data）
+   [无]  outputs/ 目录不存在（运行时自动创建，无需手工）
+
+ 环境
+   [无]  conda 未安装：`which conda` 无输出；
+         /home/work/anaconda3/ 仅有 pkgs/（94208 字节的目录），**没有 bin/python**
+   [残]  conda_envs/glmap 存在但残缺：190 个 conda 包 / 约 2.1G（Qt6 全家桶、numpy
+         1.26.4、matplotlib、imageio...），site-packages 仅 77 项，
+         **没有 torch / habitat / openai / ollama / lavis / open3d / ultralytics**
+         → pip 段完全没执行
+   [注]  该环境的创建记录：2026-09-15 08:54，命令为
+         `/home/laotou/miniconda3/bin/conda env create -f environment.yml`
+         —— 是**另一个用户、另一台机器**建的，前缀已失效，不建议复用
+   [存]  conda_pkgs/ 有 383 个包缓存（这是该项目配置的 pkgs_dirs 落点），约 2.9G
+   [注]  ~/.config/pip/pip.conf 只有 `no-cache-dir = true`，**没有配国内镜像**
+
+ 硬件
+   [OK]  GPU：NVIDIA GeForce RTX 3060，12288 MiB（12GB）
+   [OK]  磁盘：/mnt/diskdata 916G 总 / 383G 可用（HM3D 建议留 150G+）
+   [需查] nvcc 是否安装 —— 未在本次检查范围内，编译 diff-gaussian-rasterization
+         前请执行 `nvcc -V` 确认；没有则需装 CUDA Toolkit 12.4
+
+
+================================================================================
+6. 建议的推进顺序（给你一个可执行的路线）
+================================================================================
+ 第 1 步  装 Miniconda（或 Anaconda）+ CUDA Toolkit 12.4（要 nvcc）
+ 第 2 步  配好 conda / pip 国内镜像（第 3 节），再 `conda env create -f environment.yml`
+          （不要复用 conda_envs/glmap）
+ 第 3 步  开代理 → 手工 clone 4 个子模块 + 编译 diff-gaussian-rasterization
+ 第 4 步  装 habitat-sim 0.3.1 + habitat-lab（v0.3.1）
+ 第 5 步  立刻去 https://aihabitat.org/datasets/hm3d/ **提交 HM3D 申请**
+          （审批要几天，越早提交越好，期间做第 6~8 步）
+ 第 6 步  开代理 → 下 3 个 VLM 权重到 data/
+ 第 7 步  起 4 个 VLM 服务（export PYTHONPATH=$PWD/src），确认端口通
+ 第 8 步  做第 4 节的云端 API 改造（路线 A）：3 个文件 + 5 个配置 + 一个 .env
+ 第 9 步  HM3D 审批下来后下载 val split + ObjectNav 情节数据，放好目录结构
+ 第 10 步 关掉代理（或设好 no_proxy）→ `python demo.py --preset` 跑通
+ 第 11 步 检查 outputs/ 产物：glmap.pkl / gaussians/*.ply / rendered/*.png
+ 第 12 步 打开 PLY 或丢到 https://superspl.at/editor 确认高斯效果
+
+================================================================================
+（完）本文档仅为阅读与规划用途，未对 GLMap 项目做任何修改。
+================================================================================
